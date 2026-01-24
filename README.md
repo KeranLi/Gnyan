@@ -1,4 +1,4 @@
-## Gnyan | **གཉན** ： Using pretrained foundational model and data assimilation to link modern and plaeo Tibet plateau
+## Gnyan | **གཉན** : Using pretrained foundational model and data assimilation to link modern and plaeo Tibet plateau
 
 This project, named **gnyan**, is designed to run the **GraphCast** model for analyzing and predicting climate data specific to the **Tibet** region.
 
