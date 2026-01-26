@@ -2,6 +2,7 @@ import os
 import rioxarray as rxr
 import matplotlib.pyplot as plt
 import argparse
+from tqdm import tqdm
 
 def parse_args():
     # 创建 argparse 对象
@@ -22,32 +23,49 @@ def visualize_dem(dem_file, output_dir):
     # 加载 DEM 数据
     dem_data = rxr.open_rasterio(dem_file, masked=True)
 
-    # 如果数据是 3D（例如多个时间步或层），选择第一个切片
+    # 如果数据是 3D，选择第一个切片
     if dem_data.ndim == 3:
-        dem_data = dem_data.isel(band=0)  # 选择第一个 band 或层，确保是二维数据
+        dem_data = dem_data.isel(band=0)
 
-    # 创建绘图
-    plt.figure(figsize=(10, 8))
+    # 创建绘图容器
+    fig, ax = plt.subplots(figsize=(10, 8))
 
-    # 使用 imshow 显示 DEM 数据并获取 mappable 对象
-    im = dem_data.plot.imshow(cmap='terrain', figsize=(10, 8))
+    # 核心修改点 1: 使用 add_colorbar=True (默认) 并通过 cbar_kwargs 定制，避免手动创建
+    # 核心修改点 2: 设置 xarray 绘图到指定的 ax 上
+    dem_data.plot.imshow(
+        ax=ax,
+        cmap='terrain', 
+        cbar_kwargs={'label': 'Elevation (m)'}
+    )
 
-    # 设置标题为子区域名称
-    plt.title(f'DEM Visualization - {os.path.basename(dem_file)}', fontsize=16)
-    
-    # 显示颜色条，传递 mappable 对象
-    plt.colorbar(im, label='Elevation (m)')
+    # 核心修改点 3: 保持原始地理比例 (防止Y轴拉伸)
+    # 'equal' 确保横纵坐标单位长度相等
+    ax.set_aspect('equal')
 
-    # 保存图像为 PNG 格式
+    # 设置标题和标签
+    ax.set_title(f'DEM Visualization - {os.path.basename(dem_file)}', fontsize=16)
+    ax.set_xlabel('Longitude')
+    ax.set_ylabel('Latitude')
+
+    # 保存图像
     save_path = os.path.join(output_dir, f'{os.path.splitext(os.path.basename(dem_file))[0]}_visualization.png')
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
 
-    # 清理当前图像，以便绘制下一个
-    plt.close()
+    # 关闭画布释放内存
+    plt.close(fig)
+
+def process_files(dem_files, output_dir):
+    # 使用 tqdm 显示进度条
+    for dem_file in tqdm(dem_files, desc="Processing DEM files", unit="file"):
+        print(f"Processing file: {os.path.basename(dem_file)}")
+        visualize_dem(dem_file, output_dir)
 
 if __name__ == "__main__":
     # 解析命令行参数
     args = parse_args()
-    
-    # 调用可视化函数
-    visualize_dem(args.dem_dir, args.output_dir)
+
+    # 获取文件夹下的所有 DEM 文件
+    dem_files = [args.dem_dir]
+
+    # 调用进度条处理文件
+    process_files(dem_files, args.output_dir)
