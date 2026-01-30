@@ -16,12 +16,24 @@ def parse_args():
     p.add_argument("--ref_nc", type=str, required=True, help="ERA5 subdomain netcdf containing lat/lon coords")
     p.add_argument("--out_dir", type=str, required=True)
     p.add_argument("--out_name", type=str, default="dem_on_era5_grid")
+
+    # ✅ 你 ERA5 是 latitude/longitude；运行时传 --lat_name latitude --lon_name longitude
     p.add_argument("--lat_name", type=str, default="lat")
     p.add_argument("--lon_name", type=str, default="lon")
+
     p.add_argument("--dtype", type=str, default="float32")
     p.add_argument("--fill_value", type=float, default=np.nan)
     p.add_argument("--resampling", type=str, default="bilinear",
                    choices=["nearest", "bilinear", "average"])
+
+    # ✅ 新增：拼接策略
+    # overwrite: 有效值直接覆盖（推荐）
+    # first:     先到先得（你原来的逻辑）
+    # mean:      重叠区在线均值
+    # max:       重叠区取最大（有时可避免边缘小坑）
+    p.add_argument("--merge_method", type=str, default="overwrite",
+                   choices=["overwrite", "first", "mean", "max"])
+
     p.add_argument("--overwrite", action="store_true")
     return p.parse_args()
 
@@ -54,10 +66,7 @@ def make_dst_transform(lat, lon):
     lon = np.asarray(lon)
 
     lat_desc = lat[0] > lat[-1]
-    if not lat_desc:
-        lat_use = lat[::-1]
-    else:
-        lat_use = lat
+    lat_use = lat if lat_desc else lat[::-1]
 
     dlat = float(abs(lat_use[1] - lat_use[0])) if lat_use.size > 1 else 0.25
     dlon = float(abs(lon[1] - lon[0])) if lon.size > 1 else 0.25
@@ -95,26 +104,34 @@ def main():
     if (os.path.exists(out_npy) or os.path.exists(out_meta)) and not args.overwrite:
         raise FileExistsError("Output exists. Use --overwrite.")
 
-    # memmap: write big array on disk with tiny RAM usage
+    # ✅ 建议：输出 fill_value 用 NaN（float32 下最稳）
+    # 如果用户传了非 NaN 的 fill_value，也照样支持
     mmap = np.lib.format.open_memmap(out_npy, mode="w+", dtype=np.dtype(args.dtype), shape=(H, W))
     mmap[:] = args.fill_value
 
-    # a boolean mask to track where we already have valid values
-    filled = np.zeros((H, W), dtype=bool)
+    # 对 mean/max/first 需要的辅助数组
+    filled = np.zeros((H, W), dtype=bool)              # for "first"
+    sum_arr = None
+    cnt_arr = None
+    if args.merge_method == "mean":
+        sum_arr = np.zeros((H, W), dtype="float64")    # 用 float64 累加更稳
+        cnt_arr = np.zeros((H, W), dtype="uint32")
 
     resampling = get_resampling(args.resampling)
 
-    for fp in tqdm(dem_files, desc="Reprojecting tiles"):
+    for fp in tqdm(dem_files, desc=f"Reprojecting tiles ({args.merge_method})"):
         with rasterio.open(fp) as src:
-            src_data = src.read(1)
+            if src.crs is None:
+                raise ValueError(f"DEM tile has no CRS: {fp} (crs=None). Please set CRS before warping.")
 
-            # mark nodata as NaN for safer reproject
+            src_data = src.read(1).astype("float32", copy=False)
+
+            # nodata -> NaN（即使 nodata=None 也没事）
             src_nodata = src.nodata
             if src_nodata is not None:
-                src_data = src_data.astype("float32", copy=False)
                 src_data[src_data == src_nodata] = np.nan
 
-            tmp = np.full((H, W), np.nan, dtype="float32")  # per-tile buffer
+            tmp = np.full((H, W), np.nan, dtype="float32")
 
             reproject(
                 source=src_data,
@@ -130,11 +147,41 @@ def main():
             if not np.any(valid):
                 continue
 
-            # 写入策略：哪里还没填过，就写入；你也可以改成“覆盖写入”或“取平均”
-            write_mask = valid & (~filled)
-            if np.any(write_mask):
-                mmap[write_mask] = tmp[write_mask].astype(mmap.dtype, copy=False)
-                filled[write_mask] = True
+            if args.merge_method == "overwrite":
+                # ✅ 推荐：有效值直接覆盖
+                mmap[valid] = tmp[valid].astype(mmap.dtype, copy=False)
+
+            elif args.merge_method == "first":
+                # 你原来的逻辑：哪里没填过才写
+                write_mask = valid & (~filled)
+                if np.any(write_mask):
+                    mmap[write_mask] = tmp[write_mask].astype(mmap.dtype, copy=False)
+                    filled[write_mask] = True
+
+            elif args.merge_method == "max":
+                # 重叠区取最大（需要当前 mmap 有可比较值；NaN 处理）
+                cur = np.array(mmap, copy=False)
+                cur_valid = ~np.isnan(cur)
+                # 若 cur 是 NaN 且 tmp 有值 -> 用 tmp
+                take_tmp = valid & (~cur_valid)
+                if np.any(take_tmp):
+                    mmap[take_tmp] = tmp[take_tmp].astype(mmap.dtype, copy=False)
+                # 二者都有值 -> 取 max
+                both = valid & cur_valid
+                if np.any(both):
+                    mmap[both] = np.maximum(cur[both], tmp[both]).astype(mmap.dtype, copy=False)
+
+            elif args.merge_method == "mean":
+                # 在线均值：sum/cnt
+                sum_arr[valid] += tmp[valid].astype("float64", copy=False)
+                cnt_arr[valid] += 1
+
+    # mean 模式：写回 mmap
+    if args.merge_method == "mean":
+        mean_mask = cnt_arr > 0
+        # 先填 fill_value，再填 mean
+        mmap[:] = args.fill_value
+        mmap[mean_mask] = (sum_arr[mean_mask] / cnt_arr[mean_mask]).astype(mmap.dtype)
 
     # 如果参考 lat 原本是升序，我们前面为了 transform 翻成降序了，这里翻回去
     if not lat_is_desc:
@@ -152,6 +199,7 @@ def main():
         "lon_name": args.lon_name,
         "crs": "EPSG:4326",
         "resampling": args.resampling,
+        "merge_method": args.merge_method,
         "note": "DEM tiles reprojected/resampled onto ERA5 subdomain lat/lon grid. Output shape matches ref lat/lon."
     }
     with open(out_meta, "w", encoding="utf-8") as f:
